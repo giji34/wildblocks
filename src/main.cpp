@@ -173,13 +173,10 @@ int main(int argc, char *argv[]) {
                             if (id == blocks::unknown) {
                                 continue;
                             }
-                            if (id == blocks::minecraft::air && block->fProperties.empty()) {
-                                continue;
-                            }
                             ostringstream values;
                             values << "(" << x << ", " << y << ", " << z << ", " << dimension << ", \"" << version << "\", " << id << ", ";
                             if (!block->fProperties.empty()) {
-                                values << "\"{";
+                                values << "\"";
                                 bool f = true;
                                 for (auto it = block->fProperties.begin(); it != block->fProperties.end(); it++) {
                                     if (!f) {
@@ -188,7 +185,7 @@ int main(int argc, char *argv[]) {
                                     values << it->first + "=" + it->second;
                                     f = false;
                                 }
-                                values << "}\"";
+                                values << "\"";
                             } else {
                                 values << "null";
                             }
