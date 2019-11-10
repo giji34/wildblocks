@@ -2,6 +2,7 @@
 #include <iostream>
 #include <sqlite3.h>
 #include <sstream>
+#include "hwm/task/task_queue.hpp"
 
 using namespace std;
 using namespace mcfile;
@@ -62,6 +63,11 @@ int main(int argc, char *argv[]) {
     cout << "dimension: " << dimension << endl;
     cout << "version:   " << version << endl;
 
+    if (sqlite3_config(SQLITE_CONFIG_SERIALIZED) != SQLITE_OK) {
+        cerr << "Can't select serialized mode" << endl;
+        return -1;
+    }
+    
     sqlite3* db = nullptr;
     if (sqlite3_open(dbFile.c_str(), &db)) {
         cerr << "Can't open database: " << dbFile << endl;
@@ -140,63 +146,72 @@ int main(int argc, char *argv[]) {
         sqlite3_close(db);
         return -1;
     }
-    
+
+    hwm::task_queue q(thread::hardware_concurrency());
+    vector<future<void>> futures;
+
     World world(worldDir);
-    world.eachRegions([db, dimension, version](shared_ptr<Region> const& region) {
+    world.eachRegions([db, dimension, version, &futures, &q](shared_ptr<Region> const& region) {
         cout << "[info] region [" << region->fX << ", " << region->fZ << "]" << endl;
-        bool error = false;
-        region->loadAllChunks(error, [db, dimension, version](Chunk const& chunk) {
-            bool first = true;
-            ostringstream insert;
-            insert << "insert or replace into wild_blocks (x, y, z, dimension, version, material_id, data) values ";
-            for (int y = 0; y < 256; y++) {
-                for (int x = chunk.minBlockX(); x <= chunk.maxBlockX(); x++) {
-                    for (int z = chunk.minBlockZ(); z <= chunk.maxBlockZ(); z++) {
-                        shared_ptr<Block> block = chunk.blockAt(x, y, z);
-                        if (!block) {
-                            continue;
-                        }
-                        blocks::BlockId id = blocks::FromName(block->fName);
-                        if (id == blocks::unknown) {
-                            continue;
-                        }
-                        ostringstream values;
-                        values << "(" << x << ", " << y << ", " << z << ", " << dimension << ", \"" << version << "\", " << id << ", ";
-                        if (!block->fProperties.empty()) {
-                            values << "\"{";
-                            bool f = true;
-                            for (auto it = block->fProperties.begin(); it != block->fProperties.end(); it++) {
-                                if (!f) {
-                                    values << ",";
-                                }
-                                values << it->first + "=" + it->second;
-                                f = false;
+        futures.emplace_back(q.enqueue([db, dimension, version, region]() {
+            bool error = false;
+            region->loadAllChunks(error, [db, dimension, version](Chunk const& chunk) {
+                bool first = true;
+                ostringstream insert;
+                insert << "insert or replace into wild_blocks (x, y, z, dimension, version, material_id, data) values ";
+                for (int y = 0; y < 256; y++) {
+                    for (int x = chunk.minBlockX(); x <= chunk.maxBlockX(); x++) {
+                        for (int z = chunk.minBlockZ(); z <= chunk.maxBlockZ(); z++) {
+                            shared_ptr<Block> block = chunk.blockAt(x, y, z);
+                            if (!block) {
+                                continue;
                             }
-                            values << "}\"";
-                        } else {
-                            values << "null";
+                            blocks::BlockId id = blocks::FromName(block->fName);
+                            if (id == blocks::unknown) {
+                                continue;
+                            }
+                            ostringstream values;
+                            values << "(" << x << ", " << y << ", " << z << ", " << dimension << ", \"" << version << "\", " << id << ", ";
+                            if (!block->fProperties.empty()) {
+                                values << "\"{";
+                                bool f = true;
+                                for (auto it = block->fProperties.begin(); it != block->fProperties.end(); it++) {
+                                    if (!f) {
+                                        values << ",";
+                                    }
+                                    values << it->first + "=" + it->second;
+                                    f = false;
+                                }
+                                values << "}\"";
+                            } else {
+                                values << "null";
+                            }
+                            values << ")";
+                            if (!first) {
+                                insert << ", ";
+                            }
+                            insert << values.str();
+                            first = false;
                         }
-                        values << ")";
-                        if (!first) {
-                            insert << ", ";
-                        }
-                        insert << values.str();
-                        first = false;
                     }
                 }
-            }
-            insert << ";";
-            if (!first) {
-                char *e = nullptr;
-                if (sqlite3_exec(db, insert.str().c_str(), nullptr, nullptr, &e) != SQLITE_OK) {
-                    cerr << e << endl;
-                    cerr << "query=" << insert.str() << endl;
-                    sqlite3_free(e);
+                insert << ";";
+                if (!first) {
+                    char *e = nullptr;
+                    if (sqlite3_exec(db, insert.str().c_str(), nullptr, nullptr, &e) != SQLITE_OK) {
+                        cerr << e << endl;
+                        cerr << "query=" << insert.str() << endl;
+                        sqlite3_free(e);
+                    }
                 }
-            }
-            return true;
-        });
+                return true;
+            });
+        }));
     });
+
+    for (auto& f : futures) {
+        f.get();
+    }
 
     sqlite3_close(db);
 }
