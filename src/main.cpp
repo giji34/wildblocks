@@ -40,25 +40,9 @@ static int queryMaterialsCallback(void *user, int argc, char **argv, char **colu
             data = argv[i];
         }
     }
-    if (id > 0) {
+    if (id > 0 && blocks->find(data) == blocks->end()) {
         cout << "read:[" << id << "]" << data << endl;
         blocks->insert(make_pair(data, id));
-    }
-    return 0;
-}
-
-static int querySpecificMaterialCallback(void *user, int argc, char **argv, char **columnName) {
-    int *v = (int *)user;
-    for (int i = 0; i < argc; i++) {
-        if (string(columnName[i]) != "id") {
-            continue;
-        }
-        int id = -1;
-        if (sscanf(argv[i], "%d", &id) != 1) {
-            continue;
-        }
-        *v = id;
-        break;
     }
     return 0;
 }
@@ -212,63 +196,87 @@ int main(int argc, char *argv[]) {
                     bool error = false;
                     region->loadChunk(localChunkX, localChunkZ, error, [=, &dbMutex, &lutMutex, &blockLut](Chunk const& chunk) {
                         bool first = true;
-                        ostringstream insert;
-                        insert << "insert or replace into wild_blocks (x, y, z, dimension, version, material_id) values ";
-                        for (int y = 0; y < 256; y++) {
-                            for (int x = chunk.minBlockX(); x <= chunk.maxBlockX(); x++) {
-                                for (int z = chunk.minBlockZ(); z <= chunk.maxBlockZ(); z++) {
-                                    shared_ptr<Block> block = chunk.blockAt(x, y, z);
-                                    if (!block) {
-                                        continue;
-                                    }
-                                    string blockData = getBlockData(block);
-                                    if (blockData.empty()) {
-                                        continue;
-                                    }
-                                    int materialId = -1;
-                                    {
-                                        lutMutex.lock();
+                        
+                        map<tuple<int, int, int>, int> knownMaterials;
+                        map<tuple<int, int, int>, string> unknownMaterials;
+                        set<string> unknownMaterialNames;
+                        {
+                            lock_guard<mutex> lk(lutMutex);
+                            for (int y = 0; y < 256; y++) {
+                                for (int x = chunk.minBlockX(); x <= chunk.maxBlockX(); x++) {
+                                    for (int z = chunk.minBlockZ(); z <= chunk.maxBlockZ(); z++) {
+                                        shared_ptr<Block> block = chunk.blockAt(x, y, z);
+                                        if (!block) {
+                                            continue;
+                                        }
+                                        string blockData = getBlockData(block);
+                                        if (blockData.empty()) {
+                                            continue;
+                                        }
                                         if (blockLut.find(blockData) == blockLut.end()) {
-                                            lutMutex.unlock();
-                                            {
-                                                lock_guard<mutex> lk(dbMutex);
-                                                {
-                                                    ostringstream ss;
-                                                    ss << "insert into materials (data) values (\"" << blockData + "\");";
-                                                    char *e = nullptr;
-                                                    if (sqlite3_exec(db, ss.str().c_str(), nullptr, nullptr, &e) != SQLITE_OK) {
-                                                        sqlite3_free(e);
-                                                        continue;
-                                                    }
-                                                }
-                                                {
-                                                    ostringstream ss;
-                                                    ss << "select id from materials where data = \"" << blockData << "\";";
-                                                    char *e = nullptr;
-                                                    if (sqlite3_exec(db, ss.str().c_str(), querySpecificMaterialCallback, &materialId, &e) != SQLITE_OK) {
-                                                        sqlite3_free(e);
-                                                        continue;
-                                                    }
-                                                }
-                                            }
-                                            lutMutex.lock();
-                                            blockLut.insert(make_pair(blockData, materialId));
-                                            cout << "insert:[" << materialId << "]" << blockData << endl;
-                                            lutMutex.unlock();
+                                            unknownMaterials.insert(make_pair(make_tuple(x, y, z), blockData));
+                                            unknownMaterialNames.insert(blockData);
                                         } else {
-                                            materialId = blockLut[blockData];
-                                            lutMutex.unlock();
+                                            int materialId = blockLut[blockData];
+                                            knownMaterials.insert(make_pair(make_tuple(x, y, z), materialId));
                                         }
                                     }
-                                    
-                                    if (!first) {
-                                        insert << ", ";
+                                }
+                            }
+                            if (!unknownMaterials.empty()) {
+                                ostringstream ss;
+                                ss << "insert into materials (data) values ";
+                                bool f = true;
+                                for (auto it = unknownMaterialNames.begin(); it != unknownMaterialNames.end(); it++) {
+                                    string blockData = *it;
+                                    if (!f) {
+                                        ss << ", ";
                                     }
-                                    insert << "(" << x << ", " << y << ", " << z << ", " << dimension << ", \"" << version << "\", " << materialId << ")";
-                                    first = false;
+                                    f = false;
+                                    ss << "(\"" << blockData << "\")";
+                                }
+                                ss << ";";
+                                {
+                                    lock_guard<mutex> lk(dbMutex);
+                                    char *e = nullptr;
+                                    if (sqlite3_exec(db, ss.str().c_str(), nullptr, nullptr, &e) != SQLITE_OK) {
+                                        cerr << e << endl;
+                                        sqlite3_free(e);
+                                    }
+                                    
+                                    if (sqlite3_exec(db, "select * from materials;", queryMaterialsCallback, &blockLut, &e) != SQLITE_OK) {
+                                        cerr << e << endl;
+                                        sqlite3_free(e);
+                                    }
+                                }
+                                for (auto it = unknownMaterials.begin(); it != unknownMaterials.end(); it++) {
+                                    auto xyz = it->first;
+                                    string blockData = it->second;
+                                    auto found = blockLut.find(blockData);
+                                    if (found == blockLut.end()) {
+                                        cerr << "データ不整合" << endl;
+                                        exit(-1);
+                                    }
+                                    knownMaterials.insert(make_pair(xyz, found->second));
                                 }
                             }
                         }
+                        map<tuple<int, int, int>, string>().swap(unknownMaterials);
+                        set<string>().swap(unknownMaterialNames);
+                        
+                        ostringstream insert;
+                        insert << "insert or replace into wild_blocks (x, y, z, dimension, version, material_id) values ";
+
+                        for (auto it = knownMaterials.begin(); it != knownMaterials.end(); it++) {
+                            auto xyz = it->first;
+                            int materialId = it->second;
+                            if (!first) {
+                                insert << ", ";
+                            }
+                            insert << "(" << get<0>(xyz) << ", " << get<1>(xyz) << ", " << get<2>(xyz) << ", " << dimension << ", \"" << version << "\", " << materialId << ")";
+                            first = false;
+                        }
+
                         insert << ";";
                         if (!first) {
                             lock_guard<mutex> lock(dbMutex);
