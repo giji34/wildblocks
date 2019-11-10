@@ -2,6 +2,7 @@
 #include <iostream>
 #include <sqlite3.h>
 #include <sstream>
+#include <set>
 #include "hwm/task/task_queue.hpp"
 
 using namespace std;
@@ -62,18 +63,29 @@ static int querySpecificMaterialCallback(void *user, int argc, char **argv, char
     return 0;
 }
 
-static int queryExistingWildBlocksCallback(void *user, int argc, char **argv, char **columnName) {
-    int *v = (int *)user;
+static int queryExistingChunksCallback(void *user, int argc, char **argv, char **columnName) {
+    set<pair<int, int>> *v = (set<pair<int, int>> *)user;
+    int chunkX, chunkZ, count;
+    int num = 0;
     for (int i = 0; i < argc; i++) {
-        if (string(columnName[i]) != "count(*)") {
+        string name(columnName[i]);
+        int v;
+        if (sscanf(argv[i], "%d", &v) != 1) {
             continue;
         }
-        int t = -1;
-        if (sscanf(argv[i], "%d", &t) != 1) {
+        if (name == "count(*)") {
+            count = v;
+        } else if (name == "chunkX") {
+            chunkX = v;
+        } else if (name == "chunkZ") {
+            chunkZ = v;
+        } else {
             continue;
         }
-        *v = t;
-        break;
+        num++;
+    }
+    if (num == 3 && count > 0) {
+        v->insert(make_pair(chunkX, chunkZ));
     }
     return 0;
 }
@@ -174,41 +186,29 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
+    set<pair<int, int>> existingChunks;
+    if (sqlite3_exec(db, "select count(*), x >> 4 as chunkX, z >> 4 as chunkZ from wild_blocks group by chunkX, chunkZ;", queryExistingChunksCallback, &existingChunks, &error) != SQLITE_OK) {
+        cerr << error << endl;
+        sqlite3_free(error);
+        sqlite3_close(db);
+        return -1;
+    }
+    
     hwm::task_queue q(thread::hardware_concurrency());
     vector<future<void>> futures;
     mutex dbMutex;
 
     World world(worldDir);
-    world.eachRegions([db, version, dimension, &futures, &q, &blockLut, &dbMutex, &lutMutex](shared_ptr<Region> const& region) {
+    world.eachRegions([db, version, dimension, &existingChunks, &futures, &q, &blockLut, &dbMutex, &lutMutex](shared_ptr<Region> const& region) {
         for (int localChunkX = 0; localChunkX <= 32; localChunkX++) {
             for (int localChunkZ = 0; localChunkZ <= 32; localChunkZ++) {
-                int minBlockX = (region->fX * 32 + localChunkX) * 16;
-                int maxBlockX = minBlockX + 15;
-                int minBlockZ = (region->fZ * 32 + localChunkZ) * 16;
-                int maxBlockZ = minBlockZ + 15;
-
-                futures.emplace_back(q.enqueue([db, region, version, dimension, localChunkX, localChunkZ, minBlockX, maxBlockX, minBlockZ, maxBlockZ, &dbMutex, &lutMutex, &blockLut]() {
-                    {
-                        lock_guard<mutex> lk(dbMutex);
-                        int existingBlocks = -1;
-                        ostringstream ss;
-                        ss << "select count(*) from wild_blocks where "
-                            << minBlockX << " <= x and x <= " << maxBlockX
-                            << " and 0 <= y and y <= 255"
-                            << " and " << minBlockZ << " <= z and z <= " << maxBlockZ
-                            << " and version = \"" << version << "\""
-                            << " and dimension = " << dimension
-                            << ";";
-                        char *e = nullptr;
-                        if (sqlite3_exec(db, ss.str().c_str(), queryExistingWildBlocksCallback, &existingBlocks, &e) != SQLITE_OK) {
-                            sqlite3_free(e);
-                        } else {
-                            if (existingBlocks > 0) {
-                                return;
-                            }
-                        }
-                    }
-                    
+                int chunkX = region->fX * 32 + localChunkX;
+                int chunkZ = region->fZ * 32 + localChunkZ;
+                if (existingChunks.find(make_pair(chunkX, chunkZ)) != existingChunks.end()) {
+                    continue;
+                }
+                
+                futures.emplace_back(q.enqueue([db, region, version, dimension, localChunkX, localChunkZ, &dbMutex, &lutMutex, &blockLut]() {
                     bool error = false;
                     region->loadChunk(localChunkX, localChunkZ, error, [=, &dbMutex, &lutMutex, &blockLut](Chunk const& chunk) {
                         bool first = true;
