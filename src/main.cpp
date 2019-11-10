@@ -62,6 +62,22 @@ static int querySpecificMaterialCallback(void *user, int argc, char **argv, char
     return 0;
 }
 
+static int queryExistingWildBlocksCallback(void *user, int argc, char **argv, char **columnName) {
+    int *v = (int *)user;
+    for (int i = 0; i < argc; i++) {
+        if (string(columnName[i]) != "count(*)") {
+            continue;
+        }
+        int t = -1;
+        if (sscanf(argv[i], "%d", &t) != 1) {
+            continue;
+        }
+        *v = t;
+        break;
+    }
+    return 0;
+}
+
 // minecraft:grass_block[snowy=false]
 static string getBlockData(shared_ptr<Block> const& block) {
     ostringstream s;
@@ -163,84 +179,111 @@ int main(int argc, char *argv[]) {
     mutex dbMutex;
 
     World world(worldDir);
-    world.eachRegions([db, dimension, version, &futures, &q, &blockLut, &dbMutex, &lutMutex](shared_ptr<Region> const& region) {
-        int regionX = region->fX;
-        int regionZ = region->fZ;
-        futures.emplace_back(q.enqueue([db, dimension, version, region, &dbMutex, regionX, regionZ, &lutMutex, &blockLut]() {
-            cout << "region [" << regionX << ", " << regionZ << "]" << endl;
-            bool error = false;
-            region->loadAllChunks(error, [db, dimension, version, &dbMutex, &lutMutex, &blockLut](Chunk const& chunk) {
-                bool first = true;
-                ostringstream insert;
-                insert << "insert or replace into wild_blocks (x, y, z, dimension, version, material_id) values ";
-                for (int y = 0; y < 256; y++) {
-                    for (int x = chunk.minBlockX(); x <= chunk.maxBlockX(); x++) {
-                        for (int z = chunk.minBlockZ(); z <= chunk.maxBlockZ(); z++) {
-                            shared_ptr<Block> block = chunk.blockAt(x, y, z);
-                            if (!block) {
-                                continue;
+    world.eachRegions([db, version, dimension, &futures, &q, &blockLut, &dbMutex, &lutMutex](shared_ptr<Region> const& region) {
+        for (int localChunkX = 0; localChunkX <= 32; localChunkX++) {
+            for (int localChunkZ = 0; localChunkZ <= 32; localChunkZ++) {
+                int minBlockX = (region->fX * 32 + localChunkX) * 16;
+                int maxBlockX = minBlockX + 15;
+                int minBlockZ = (region->fZ * 32 + localChunkZ) * 16;
+                int maxBlockZ = minBlockZ + 15;
+
+                futures.emplace_back(q.enqueue([db, region, version, dimension, localChunkX, localChunkZ, minBlockX, maxBlockX, minBlockZ, maxBlockZ, &dbMutex, &lutMutex, &blockLut]() {
+                    {
+                        lock_guard<mutex> lk(dbMutex);
+                        int existingBlocks = -1;
+                        ostringstream ss;
+                        ss << "select count(*) from wild_blocks where "
+                            << minBlockX << " <= x and x <= " << maxBlockX
+                            << " and 0 <= y and y <= 255"
+                            << " and " << minBlockZ << " <= z and z <= " << maxBlockZ
+                            << " and version = \"" << version << "\""
+                            << " and dimension = " << dimension
+                            << ";";
+                        char *e = nullptr;
+                        if (sqlite3_exec(db, ss.str().c_str(), queryExistingWildBlocksCallback, &existingBlocks, &e) != SQLITE_OK) {
+                            sqlite3_free(e);
+                        } else {
+                            if (existingBlocks > 0) {
+                                return;
                             }
-                            string blockData = getBlockData(block);
-                            if (blockData.empty()) {
-                                continue;
-                            }
-                            int materialId = -1;
-                            {
-                                lutMutex.lock();
-                                if (blockLut.find(blockData) == blockLut.end()) {
-                                    lutMutex.unlock();
-                                    {
-                                        lock_guard<mutex> lk(dbMutex);
-                                        {
-                                            ostringstream ss;
-                                            ss << "insert into materials (data) values (\"" << blockData + "\");";
-                                            char *e = nullptr;
-                                            if (sqlite3_exec(db, ss.str().c_str(), nullptr, nullptr, &e) != SQLITE_OK) {
-                                                sqlite3_free(e);
-                                                continue;
-                                            }
-                                        }
-                                        {
-                                            ostringstream ss;
-                                            ss << "select id from materials where data = \"" << blockData << "\";";
-                                            char *e = nullptr;
-                                            if (sqlite3_exec(db, ss.str().c_str(), querySpecificMaterialCallback, &materialId, &e) != SQLITE_OK) {
-                                                sqlite3_free(e);
-                                                continue;
-                                            }
-                                        }
-                                    }
-                                    lutMutex.lock();
-                                    blockLut.insert(make_pair(blockData, materialId));
-                                    cout << "insert:[" << materialId << "]" << blockData << endl;
-                                    lutMutex.unlock();
-                                } else {
-                                    materialId = blockLut[blockData];
-                                    lutMutex.unlock();
-                                }
-                            }
-                            
-                            if (!first) {
-                                insert << ", ";
-                            }
-                            insert << "(" << x << ", " << y << ", " << z << ", " << dimension << ", \"" << version << "\", " << materialId << ")";
-                            first = false;
                         }
                     }
-                }
-                insert << ";";
-                if (!first) {
-                    lock_guard<mutex> lock(dbMutex);
-                    char *e = nullptr;
-                    if (sqlite3_exec(db, insert.str().c_str(), nullptr, nullptr, &e) != SQLITE_OK) {
-                        cerr << e << endl;
-                        cerr << "query=" << insert.str() << endl;
-                        sqlite3_free(e);
-                    }
-                }
-                return true;
-            });
-        }));
+                    
+                    bool error = false;
+                    region->loadChunk(localChunkX, localChunkZ, error, [=, &dbMutex, &lutMutex, &blockLut](Chunk const& chunk) {
+                        bool first = true;
+                        ostringstream insert;
+                        insert << "insert or replace into wild_blocks (x, y, z, dimension, version, material_id) values ";
+                        for (int y = 0; y < 256; y++) {
+                            for (int x = chunk.minBlockX(); x <= chunk.maxBlockX(); x++) {
+                                for (int z = chunk.minBlockZ(); z <= chunk.maxBlockZ(); z++) {
+                                    shared_ptr<Block> block = chunk.blockAt(x, y, z);
+                                    if (!block) {
+                                        continue;
+                                    }
+                                    string blockData = getBlockData(block);
+                                    if (blockData.empty()) {
+                                        continue;
+                                    }
+                                    int materialId = -1;
+                                    {
+                                        lutMutex.lock();
+                                        if (blockLut.find(blockData) == blockLut.end()) {
+                                            lutMutex.unlock();
+                                            {
+                                                lock_guard<mutex> lk(dbMutex);
+                                                {
+                                                    ostringstream ss;
+                                                    ss << "insert into materials (data) values (\"" << blockData + "\");";
+                                                    char *e = nullptr;
+                                                    if (sqlite3_exec(db, ss.str().c_str(), nullptr, nullptr, &e) != SQLITE_OK) {
+                                                        sqlite3_free(e);
+                                                        continue;
+                                                    }
+                                                }
+                                                {
+                                                    ostringstream ss;
+                                                    ss << "select id from materials where data = \"" << blockData << "\";";
+                                                    char *e = nullptr;
+                                                    if (sqlite3_exec(db, ss.str().c_str(), querySpecificMaterialCallback, &materialId, &e) != SQLITE_OK) {
+                                                        sqlite3_free(e);
+                                                        continue;
+                                                    }
+                                                }
+                                            }
+                                            lutMutex.lock();
+                                            blockLut.insert(make_pair(blockData, materialId));
+                                            cout << "insert:[" << materialId << "]" << blockData << endl;
+                                            lutMutex.unlock();
+                                        } else {
+                                            materialId = blockLut[blockData];
+                                            lutMutex.unlock();
+                                        }
+                                    }
+                                    
+                                    if (!first) {
+                                        insert << ", ";
+                                    }
+                                    insert << "(" << x << ", " << y << ", " << z << ", " << dimension << ", \"" << version << "\", " << materialId << ")";
+                                    first = false;
+                                }
+                            }
+                        }
+                        insert << ";";
+                        if (!first) {
+                            lock_guard<mutex> lock(dbMutex);
+                            char *e = nullptr;
+                            if (sqlite3_exec(db, insert.str().c_str(), nullptr, nullptr, &e) != SQLITE_OK) {
+                                cerr << e << endl;
+                                cerr << "query=" << insert.str() << endl;
+                                sqlite3_free(e);
+                            }
+                        }
+                        return true;
+                    });
+                }));
+            }
+        }
     });
 
     for (auto& f : futures) {
