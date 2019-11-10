@@ -74,6 +74,20 @@ static int queryExistingChunksCallback(void *user, int argc, char **argv, char *
     return 0;
 }
 
+static int queryVersionCallback(void *user, int argc, char **argv, char **columnName) {
+    int *v = (int *)user;
+    for (int i = 0; i < argc; i++) {
+        if (string(columnName[i]) == "id") {
+            int t;
+            if (sscanf(argv[i], "%d", &t) == 1) {
+                *v = t;
+                break;
+            }
+        }
+    }
+    return 0;
+}
+
 // minecraft:grass_block[snowy=false]
 static string getBlockData(shared_ptr<Block> const& block) {
     ostringstream s;
@@ -142,8 +156,8 @@ int main(int argc, char *argv[]) {
             y integer not null,
             z integer not null,
             dimension integer not null,
-            version text not null,
-            material_id integer
+            version_id integer not null,
+            material_id integer not null
         );)";
     if (sqlite3_exec(db, createWildBlocksTable.c_str(), nullptr, nullptr, &error) != SQLITE_OK) {
         cerr << error << endl;
@@ -152,6 +166,43 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
+    string createVersionsTable = R"(create table if not exists versions (
+        id integer primary key autoincrement,
+        version text not null
+    );)";
+    if (sqlite3_exec(db, createVersionsTable.c_str(), nullptr, nullptr, &error) != SQLITE_OK) {
+        cerr << error << endl;
+        sqlite3_free(error);
+        sqlite3_close(db);
+        return -1;
+    }
+
+    int versionId = -1;
+    if (sqlite3_exec(db, (string("select * from versions where version = ") + version).c_str(), queryVersionCallback, &versionId, &error) != SQLITE_OK) {
+        cerr << error << endl;
+        sqlite3_free(error);
+        sqlite3_close(db);
+        return -1;
+    }
+    if (versionId < 0) {
+        if (sqlite3_exec(db, (string("insert into versions (version) values (") + version + string(");")).c_str(), nullptr, nullptr, &error) != SQLITE_OK) {
+            cerr << error << endl;
+            sqlite3_free(error);
+            sqlite3_close(db);
+            return -1;
+        }
+        if (sqlite3_exec(db, (string("select * from versions where version = ") + version).c_str(), queryVersionCallback, &versionId, &error) != SQLITE_OK) {
+            cerr << error << endl;
+            sqlite3_free(error);
+            sqlite3_close(db);
+            return -1;
+        }
+    }
+    if (versionId < 0) {
+        cerr << "versionId が取得できない" << endl;
+        return -1;
+    }
+    
     map<string, int> blockLut;
     mutex lutMutex;
     string queryMaterials = "select * from materials;";
@@ -162,7 +213,7 @@ int main(int argc, char *argv[]) {
         return -1;
     }
     
-    string createIndex = "create unique index if not exists wild_blocks_unique_coordinate on wild_blocks (x, y, z, dimension, version);";
+    string createIndex = "create unique index if not exists wild_blocks_unique_coordinate on wild_blocks (x, y, z, dimension, version_id);";
     if (sqlite3_exec(db, createIndex.c_str(), nullptr, nullptr, &error) != SQLITE_OK) {
         cerr << error << endl;
         sqlite3_free(error);
@@ -183,7 +234,7 @@ int main(int argc, char *argv[]) {
     mutex dbMutex;
 
     World world(worldDir);
-    world.eachRegions([db, version, dimension, &existingChunks, &futures, &q, &blockLut, &dbMutex, &lutMutex](shared_ptr<Region> const& region) {
+    world.eachRegions([=, &existingChunks, &futures, &q, &blockLut, &dbMutex, &lutMutex](shared_ptr<Region> const& region) {
         for (int localChunkX = 0; localChunkX <= 32; localChunkX++) {
             for (int localChunkZ = 0; localChunkZ <= 32; localChunkZ++) {
                 int chunkX = region->fX * 32 + localChunkX;
@@ -192,7 +243,7 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
                 
-                futures.emplace_back(q.enqueue([db, region, version, dimension, localChunkX, localChunkZ, &dbMutex, &lutMutex, &blockLut]() {
+                futures.emplace_back(q.enqueue([=, &dbMutex, &lutMutex, &blockLut]() {
                     bool error = false;
                     region->loadChunk(localChunkX, localChunkZ, error, [=, &dbMutex, &lutMutex, &blockLut](Chunk const& chunk) {
                         bool first = true;
@@ -265,7 +316,7 @@ int main(int argc, char *argv[]) {
                         set<string>().swap(unknownMaterialNames);
                         
                         ostringstream insert;
-                        insert << "insert or replace into wild_blocks (x, y, z, dimension, version, material_id) values ";
+                        insert << "insert or replace into wild_blocks (x, y, z, dimension, version_id, material_id) values ";
 
                         for (auto it = knownMaterials.begin(); it != knownMaterials.end(); it++) {
                             auto xyz = it->first;
@@ -273,7 +324,7 @@ int main(int argc, char *argv[]) {
                             if (!first) {
                                 insert << ", ";
                             }
-                            insert << "(" << get<0>(xyz) << ", " << get<1>(xyz) << ", " << get<2>(xyz) << ", " << dimension << ", \"" << version << "\", " << materialId << ")";
+                            insert << "(" << get<0>(xyz) << ", " << get<1>(xyz) << ", " << get<2>(xyz) << ", " << dimension << ", " << versionId << ", " << materialId << ")";
                             first = false;
                         }
 
