@@ -149,13 +149,16 @@ int main(int argc, char *argv[]) {
 
     hwm::task_queue q(thread::hardware_concurrency());
     vector<future<void>> futures;
+    mutex m;
 
     World world(worldDir);
-    world.eachRegions([db, dimension, version, &futures, &q](shared_ptr<Region> const& region) {
-        cout << "[info] region [" << region->fX << ", " << region->fZ << "]" << endl;
-        futures.emplace_back(q.enqueue([db, dimension, version, region]() {
+    world.eachRegions([db, dimension, version, &futures, &q, &m](shared_ptr<Region> const& region) {
+        int regionX = region->fX;
+        int regionZ = region->fZ;
+        futures.emplace_back(q.enqueue([db, dimension, version, region, &m, regionX, regionZ]() {
+            cout << "region [" << regionX << ", " << regionZ << "]" << endl;
             bool error = false;
-            region->loadAllChunks(error, [db, dimension, version](Chunk const& chunk) {
+            region->loadAllChunks(error, [db, dimension, version, &m](Chunk const& chunk) {
                 bool first = true;
                 ostringstream insert;
                 insert << "insert or replace into wild_blocks (x, y, z, dimension, version, material_id, data) values ";
@@ -168,6 +171,9 @@ int main(int argc, char *argv[]) {
                             }
                             blocks::BlockId id = blocks::FromName(block->fName);
                             if (id == blocks::unknown) {
+                                continue;
+                            }
+                            if (id == blocks::minecraft::air && block->fProperties.empty()) {
                                 continue;
                             }
                             ostringstream values;
@@ -197,6 +203,7 @@ int main(int argc, char *argv[]) {
                 }
                 insert << ";";
                 if (!first) {
+                    lock_guard<mutex> lock(m);
                     char *e = nullptr;
                     if (sqlite3_exec(db, insert.str().c_str(), nullptr, nullptr, &e) != SQLITE_OK) {
                         cerr << e << endl;
