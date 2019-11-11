@@ -389,6 +389,7 @@ int main(int argc, char *argv[]) {
                             }
                             AppendInt(blob, (uint32_t)materialId);
                         }
+                        mcfile::detail::Compression::compress(blob);
                         
                         {
                             lock_guard<mutex> lk(dbMutex);
