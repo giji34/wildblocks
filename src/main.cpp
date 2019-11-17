@@ -42,32 +42,29 @@ static string GetBlockData(shared_ptr<Block> const& block) {
     return s.str();
 }
 
-static int ChunkLocalIndexFromBlockXYZ(int x, int y, int z, int minBlockX, int minBlockZ) {
-    int offsetX = x - minBlockX;
-    int offsetZ = z - minBlockZ;
-    return y * 16 * 16 + offsetZ * 16 + offsetX;
-}
-
 static void AppendInt(vector<uint8_t> &buffer, uint32_t data) {
-    while (data > 0) {
+    while (true) {
         uint8_t v = (uint8_t)(0x7F & data);
         data = data >> 7;
         if (data > 0) {
-            v = v | 0x80;
+            v = v | (uint8_t)0x80;
         }
         buffer.push_back(v);
+        if (data == 0) {
+            break;
+        }
     }
 }
 
-static void CreateWorldBlockPalette(World const& world, set<string> &result, int numRegions) {
+static void CreateWorldBlockPalette(World const& world, vector<string> &result, int numRegions) {
     hwm::task_queue q(thread::hardware_concurrency());
-    vector<future<set<string>>> futures;
+    vector<future<map<string, int>>> futures;
     mutex countMutex;
     int finishedRegions = 0;
 
     world.eachRegions([=, &q, &futures, &finishedRegions, &countMutex](shared_ptr<Region> const& region) {
         futures.emplace_back(q.enqueue([=, &finishedRegions, &countMutex](shared_ptr<Region> const& region) {
-            set<string> regionPartial;
+            map<string, int> regionPartial;
             bool e = false;
             region->loadAllChunks(e, [&regionPartial](Chunk const& chunk) {
                 for (int y = 0; y < 256; y++) {
@@ -78,7 +75,7 @@ static void CreateWorldBlockPalette(World const& world, set<string> &result, int
                                 continue;
                             }
                             string blockData = GetBlockData(block);
-                            regionPartial.insert(blockData);
+                            regionPartial[blockData] += 1;
                         }
                     }
                 }
@@ -92,14 +89,29 @@ static void CreateWorldBlockPalette(World const& world, set<string> &result, int
             return regionPartial;
         }, region));
     });
+    map<string, int> blockAndUsedCount;
     for (auto &f : futures) {
-        set<string> partial = f.get();
-        for_each(partial.begin(), partial.end(), [&result](auto const& it) {
-            string blockData = it;
-            result.insert(blockData);
+        map<string, int> partial = f.get();
+        for_each(partial.begin(), partial.end(), [&blockAndUsedCount](auto const& it) {
+            blockAndUsedCount[it.first] += it.second;
         });
     }
-    cout << "palette created: " << result.size() << " entries" << endl;
+
+    vector<pair<string, int>> buffer;
+    buffer.reserve(blockAndUsedCount.size());
+    for (auto it = blockAndUsedCount.begin(); it != blockAndUsedCount.end(); it++) {
+        buffer.push_back(make_pair(it->first, it->second));
+    }
+    sort(buffer.begin(), buffer.end(), [](auto const& a, auto const& b) {
+        return a.second > b.second;
+    });
+    result.clear();
+    result.reserve(buffer.size());
+    for_each(buffer.begin(), buffer.end(), [&result](auto const& it) {
+        result.push_back(it.first);
+    });
+
+    cout << "palette created: " << blockAndUsedCount.size() << " entries" << endl;
 }
 
 static int CountRegionFiles(string worldDir) {
@@ -166,14 +178,14 @@ int main(int argc, char *argv[]) {
     World world(worldDir);
     int numRegions = CountRegionFiles(worldDir);
 
-    set<string> paletteBlockData;
+    vector<string> paletteBlockData;
     CreateWorldBlockPalette(world, paletteBlockData, numRegions);
     
     fs::path paletteFile = rootDir / "palette.txt"s;
     map<string, int> palette;
     {
         int idx = 0;
-        ofstream paletteStream(paletteFile.c_str());
+        ofstream paletteStream(paletteFile.c_str(), ios::trunc);
         for (auto it = paletteBlockData.begin(); it != paletteBlockData.end(); it++) {
             string blockData = *it;
             palette.insert(make_pair(blockData, idx));
@@ -193,15 +205,10 @@ int main(int argc, char *argv[]) {
             bool e = false;
             region->loadAllChunks(e, [=](Chunk const& chunk) {
                 fs::path file = rootDir / ("c." + to_string(chunk.fChunkX) + "." + to_string(chunk.fChunkZ) + ".idx");
-                if (fs::exists(file)) {
-                    return true;
-                }
-                int index = -1;
                 vector<uint8_t> blob;
                 for (int y = 0; y < 256; y++) {
                     for (int z = chunk.minBlockZ(); z <= chunk.maxBlockZ(); z++) {
                         for (int x = chunk.minBlockX(); x <= chunk.maxBlockX(); x++) {
-                            index++;
                             shared_ptr<Block> block = chunk.blockAt(x, y, z);
                             string blockData;
                             if (block) {
@@ -219,8 +226,8 @@ int main(int argc, char *argv[]) {
                     }
                 }
                 mcfile::detail::Compression::compress(blob);
-                
-                FILE *fp = fopen(file.c_str(), "wb");
+
+                FILE *fp = fopen(file.c_str(), "w+b");
                 fwrite(blob.data(), blob.size(), 1, fp);
                 fclose(fp);
                 return true;
