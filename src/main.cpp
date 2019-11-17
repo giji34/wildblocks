@@ -9,6 +9,7 @@
 
 using namespace std;
 using namespace mcfile;
+namespace fs = std::filesystem;
 
 static void print_description() {
     cerr << "wildblocks" << endl;
@@ -58,6 +59,60 @@ static void AppendInt(vector<uint8_t> &buffer, uint32_t data) {
     }
 }
 
+static void CreateWorldBlockPalette(World const& world, set<string> &result, int numRegions) {
+    hwm::task_queue q(thread::hardware_concurrency());
+    vector<future<set<string>>> futures;
+    mutex countMutex;
+    int finishedRegions = 0;
+
+    world.eachRegions([=, &q, &futures, &finishedRegions, &countMutex](shared_ptr<Region> const& region) {
+        futures.emplace_back(q.enqueue([=, &finishedRegions, &countMutex](shared_ptr<Region> const& region) {
+            set<string> regionPartial;
+            bool e = false;
+            region->loadAllChunks(e, [&regionPartial](Chunk const& chunk) {
+                for (int y = 0; y < 256; y++) {
+                    for (int z = chunk.minBlockZ(); z <= chunk.maxBlockZ(); z++) {
+                        for (int x = chunk.minBlockX(); x <= chunk.maxBlockX(); x++) {
+                            shared_ptr<Block> block = chunk.blockAt(x, y, z);
+                            if (!block) {
+                                continue;
+                            }
+                            string blockData = GetBlockData(block);
+                            regionPartial.insert(blockData);
+                        }
+                    }
+                }
+                return true;
+            });
+            {
+                lock_guard<mutex> lk(countMutex);
+                finishedRegions++;
+                cout << "palette: " << finishedRegions << "/" << numRegions << "\t" << (float(finishedRegions) / float(numRegions) * 100.0f) << "%" << endl;
+            }
+            return regionPartial;
+        }, region));
+    });
+    for (auto &f : futures) {
+        set<string> partial = f.get();
+        for_each(partial.begin(), partial.end(), [&result](auto const& it) {
+            string blockData = it;
+            result.insert(blockData);
+        });
+    }
+    cout << "palette created: " << result.size() << " entries" << endl;
+}
+
+static int CountRegionFiles(string worldDir) {
+    int numRegions = 0;
+    for (auto const& e : fs::directory_iterator(fs::path(worldDir) / "region")) {
+        int x, z;
+        if (sscanf(e.path().filename().c_str(), "r.%d.%d.mca", &x, &z) == 2) {
+            numRegions++;
+        }
+    }
+    return numRegions;
+}
+
 int main(int argc, char *argv[]) {
     string dbDir;
     string worldDir;
@@ -98,7 +153,6 @@ int main(int argc, char *argv[]) {
     cout << "dimension: " << dimension << endl;
     cout << "version:   " << version << endl;
 
-    namespace fs = std::filesystem;
     fs::path const rootDir = fs::path(dbDir) / version / to_string(dimension);
     
     if (!fs::exists(rootDir)) {
@@ -109,20 +163,22 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
-    map<string, int> palette;
-    mutex paletteMutex;
+    World world(worldDir);
+    int numRegions = CountRegionFiles(worldDir);
+
+    set<string> paletteBlockData;
+    CreateWorldBlockPalette(world, paletteBlockData, numRegions);
+    
     fs::path paletteFile = rootDir / "palette.txt"s;
+    map<string, int> palette;
     {
-        ifstream paletteStream(paletteFile.c_str());
-        string line;
-        int index = 0;
-        while (getline(paletteStream, line)) {
-            if (palette.find(line) != palette.end()) {
-                cerr << "palette 内の BlockData が重複しています: " << index << " 行目, line=\"" << line << "\"" << endl;
-                exit(1);
-            }
-            palette.insert(make_pair(line, index));
-            index++;
+        int idx = 0;
+        ofstream paletteStream(paletteFile.c_str());
+        for (auto it = paletteBlockData.begin(); it != paletteBlockData.end(); it++) {
+            string blockData = *it;
+            palette.insert(make_pair(blockData, idx));
+            paletteStream << blockData << endl;
+            idx++;
         }
     }
 
@@ -130,100 +186,49 @@ int main(int argc, char *argv[]) {
     vector<future<void>> futures;
     string const kAirBlockName = blocks::Name(blocks::minecraft::air);
     mutex logMutex;
-
-    World world(worldDir);
-    world.eachRegions([=, &futures, &q, &palette, &paletteMutex, &logMutex](shared_ptr<Region> const& region) {
-        futures.emplace_back(q.enqueue([=, &palette, &paletteMutex, &logMutex](shared_ptr<Region> const& region) {
+    int finishedRegions = 0;
+    
+    world.eachRegions([=, &futures, &q, &logMutex, &finishedRegions](shared_ptr<Region> const& region) {
+        futures.emplace_back(q.enqueue([=, &logMutex, &finishedRegions](shared_ptr<Region> const& region) {
             bool e = false;
-            region->loadAllChunks(e, [=, &palette, &paletteMutex, &logMutex](Chunk const& chunk) {
+            region->loadAllChunks(e, [=](Chunk const& chunk) {
                 fs::path file = rootDir / ("c." + to_string(chunk.fChunkX) + "." + to_string(chunk.fChunkZ) + ".idx");
                 if (fs::exists(file)) {
                     return true;
                 }
-                vector<int> materialIds(16 * 16 * 256, -1);
-                vector<string> blockDataList(16 * 16 * 256, kAirBlockName);
+                int index = -1;
+                vector<uint8_t> blob;
                 for (int y = 0; y < 256; y++) {
                     for (int z = chunk.minBlockZ(); z <= chunk.maxBlockZ(); z++) {
                         for (int x = chunk.minBlockX(); x <= chunk.maxBlockX(); x++) {
+                            index++;
                             shared_ptr<Block> block = chunk.blockAt(x, y, z);
-                            if (!block) {
-                                continue;
+                            string blockData;
+                            if (block) {
+                                blockData = GetBlockData(block);
+                            } else {
+                                blockData = kAirBlockName;
                             }
-                            int index = ChunkLocalIndexFromBlockXYZ(x, y, z, chunk.minBlockX(), chunk.minBlockZ());
-                            string blockData = GetBlockData(block);
-                            blockDataList[index] = blockData;
-                        }
-                    }
-                }
-                map<tuple<int, int, int>, string> unknownMaterials;
-                {
-                    set<string> unknownMaterialNames;
-                    lock_guard<mutex> lk(paletteMutex);
-                    for (int y = 0; y < 256; y++) {
-                        for (int z = chunk.minBlockZ(); z <= chunk.maxBlockZ(); z++) {
-                            for (int x = chunk.minBlockX(); x <= chunk.maxBlockX(); x++) {
-                                int index = ChunkLocalIndexFromBlockXYZ(x, y, z, chunk.minBlockX(), chunk.minBlockZ());
-                                string blockData = blockDataList[index];
-                                if (palette.find(blockData) == palette.end()) {
-                                    unknownMaterials.insert(make_pair(make_tuple(x, y, z), blockData));
-                                    unknownMaterialNames.insert(blockData);
-                                } else {
-                                    int materialId = palette[blockData];
-                                    materialIds[index] = materialId;
-                                }
+                            auto found = palette.find(blockData);
+                            if (found == palette.end()) {
+                                cerr << "データ不整合" << endl;
+                                exit(1);
                             }
+                            AppendInt(blob, found->second);
                         }
                     }
-                    vector<string>().swap(blockDataList);
-
-                    if (!unknownMaterials.empty()) {
-                        ofstream f(paletteFile.c_str(), ios::app);
-                        int idx = palette.size();
-                        for (auto it = unknownMaterialNames.begin(); it != unknownMaterialNames.end(); it++) {
-                            string blockData = *it;
-                            f << blockData << endl;
-                            palette.insert(make_pair(blockData, idx));
-                            idx++;
-                        }
-                    }
-                }
-
-                for (auto it = unknownMaterials.begin(); it != unknownMaterials.end(); it++) {
-                    auto xyz = it->first;
-                    string blockData = it->second;
-                    auto found = palette.find(blockData);
-                    if (found == palette.end()) {
-                        cerr << "データ不整合" << endl;
-                        exit(1);
-                    }
-                    int index = ChunkLocalIndexFromBlockXYZ(get<0>(xyz), get<1>(xyz), get<2>(xyz), chunk.minBlockX(), chunk.minBlockZ());
-                    materialIds[index] = found->second;
-                }
-
-                if (!any_of(materialIds.begin(), materialIds.end(), [](int v) { return v > 0; })) {
-                    return true;
-                }
-                vector<uint8_t> blob;
-                int airBlockMaterialId = palette[kAirBlockName];
-                for (int i = 0; i < materialIds.size(); i++) {
-                    int materialId = materialIds[i];
-                    if (materialId < 0) {
-                        materialId = airBlockMaterialId;
-                    }
-                    AppendInt(blob, (uint32_t)materialId);
                 }
                 mcfile::detail::Compression::compress(blob);
                 
-                {
-                    lock_guard<mutex> lk(logMutex);
-                    cout << file.filename().string() << endl;
-                }
-
                 FILE *fp = fopen(file.c_str(), "wb");
                 fwrite(blob.data(), blob.size(), 1, fp);
                 fclose(fp);
                 return true;
             });
+            
+            lock_guard<mutex> lk(logMutex);
+            finishedRegions++;
+            cout << finishedRegions << "/" << numRegions << "\t" << float(finishedRegions * 100.0f / numRegions) << "%" << endl;
         }, region));
     });
     
